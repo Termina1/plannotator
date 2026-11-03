@@ -30,6 +30,7 @@ type ContextMessage = {
 const tempDirs: string[] = [];
 const originalHome = process.env.HOME;
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+const originalSubagentChild = process.env.PI_SUBAGENT_CHILD;
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) {
@@ -42,6 +43,7 @@ function restoreEnv(name: string, value: string | undefined): void {
 afterEach(() => {
 	restoreEnv("HOME", originalHome);
 	restoreEnv("PI_CODING_AGENT_DIR", originalAgentDir);
+	restoreEnv("PI_SUBAGENT_CHILD", originalSubagentChild);
 
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
@@ -72,7 +74,7 @@ function makeWorkspace(projectConfig?: unknown): string {
 	return cwd;
 }
 
-function createContext(options: { cwd?: string; entries?: SessionEntry[]; projectTrusted?: boolean } = {}) {
+function createContext(options: { cwd?: string; entries?: SessionEntry[]; projectTrusted?: boolean; sessionId?: string } = {}) {
 	const entries = options.entries ?? [];
 	const notifications: Array<{ message: string; level: string | undefined }> = [];
 	return {
@@ -81,13 +83,13 @@ function createContext(options: { cwd?: string; entries?: SessionEntry[]; projec
 		isProjectTrusted: () => options.projectTrusted ?? true,
 		isIdle: () => true,
 		model: undefined,
-		modelRegistry: { find: () => undefined },
+		modelRegistry: { find: (provider: string, id: string) => ({ provider, id }) },
 		notifications,
 		sessionManager: {
 			getBranch: () => entries,
 			getEntries: () => entries,
 			getSessionFile: () => undefined,
-			getSessionId: () => "test-session",
+			getSessionId: () => options.sessionId ?? "test-session",
 			getSessionName: () => undefined,
 		},
 		ui: {
@@ -109,6 +111,8 @@ function createRuntime(initialTools: string[] = ["read", "bash", "edit", "write"
 	const commands = new Map<string, { handler: (args: string, context: ReturnType<typeof createContext>) => unknown }>();
 	const handlers = new Map<string, Handler[]>();
 	const persisted: Array<Record<string, unknown>> = [];
+	const modelChanges: unknown[] = [];
+	const thinkingChanges: string[] = [];
 
 	let activeTools = [...initialTools];
 
@@ -134,14 +138,17 @@ function createRuntime(initialTools: string[] = ["read", "bash", "edit", "write"
 		setActiveTools: (tools: string[]) => {
 			activeTools = [...tools];
 		},
-		setModel: async () => true,
-		setThinkingLevel: () => undefined,
+		setModel: async (model: unknown) => { modelChanges.push(model); return true; },
+		setThinkingLevel: (level: string) => { thinkingChanges.push(level); },
 	};
 
 	plannotator(pi as never);
 
 	return {
 		commands,
+		modelChanges,
+		thinkingChanges,
+		getActiveTools: () => activeTools,
 		lastPersistedState: () => persisted.at(-1),
 		run: async (event: string, context: ReturnType<typeof createContext>, payload: unknown = {}) => {
 			const results: unknown[] = [];
@@ -183,6 +190,76 @@ function executingContext(
 function templateWarnings(context: ReturnType<typeof createContext>): Array<{ message: string; level: string | undefined }> {
 	return context.notifications.filter((n) => n.level === "warning" && n.message.includes("unknown template variables"));
 }
+
+describe("Plannotator delegated session state", () => {
+	for (const phase of ["planning", "executing"] as const) {
+		for (const sessionId of [undefined, "parent-session"]) {
+			test(`a delegated child ignores ${phase} state owned by ${sessionId ?? "a legacy parent"}`, async () => {
+				process.env.PI_SUBAGENT_CHILD = "1";
+				const cwd = makeWorkspace();
+				// If inherited execution is rebuilt, it would also write this file.
+				const plan = "# Parent plan\n\n- [ ] Parent step\n";
+				writeFileSync(join(cwd, "PLAN.md"), plan);
+				const entries: SessionEntry[] = [{
+					type: "custom", customType: "plannotator",
+					data: {
+						sessionId, phase, lastSubmittedPath: "PLAN.md",
+						savedState: { model: { provider: "claude-bridge", id: "parent-model" }, thinkingLevel: "high" },
+						phaseAddedTools: ["parent_only_tool"], framingDelivered: true,
+					},
+				}];
+				const context = createContext({ cwd, entries, sessionId: "child-session" });
+				const runtime = createRuntime(["read", "bash", "child_tool", "plannotator_mark_done", "plannotator_submit_plan"]);
+				await runtime.run("session_start", context);
+				expect(runtime.modelChanges).toEqual([]);
+				expect(runtime.thinkingChanges).toEqual([]);
+				expect(runtime.getActiveTools()).toEqual(["read", "bash", "child_tool"]);
+				expect(runtime.lastPersistedState()).toMatchObject({ sessionId: "child-session", phase: "idle", savedState: null });
+				expect(readFileSync(join(cwd, "PLAN.md"), "utf-8")).toBe(plan);
+				expect((await startAgent(runtime, context))?.message?.content).toContain("[PLANNOTATOR - PLAN MODE OFF]");
+				expect(await startAgent(runtime, context)).toBeUndefined();
+				// Reload uses the child's own idle entry: no repeated countermand.
+				entries.push({ type: "custom", customType: "plannotator", data: runtime.lastPersistedState() });
+				const reloaded = createRuntime();
+				await reloaded.run("session_start", context);
+				expect(await startAgent(reloaded, context)).toBeUndefined();
+			});
+		}
+	}
+
+	test("a delegated child can resume its own explicitly entered plan mode", async () => {
+		process.env.PI_SUBAGENT_CHILD = "1";
+		const cwd = makeWorkspace();
+		const entries: SessionEntry[] = [];
+		const context = createContext({ cwd, entries, sessionId: "child-session" });
+		const runtime = createRuntime();
+		await runtime.run("session_start", context);
+		expect(await startAgent(runtime, context)).toBeUndefined();
+		await runtime.commands.get("plannotator-plan-mode")?.handler("", context);
+		entries.push({ type: "custom", customType: "plannotator", data: runtime.lastPersistedState() });
+		const resumed = createRuntime();
+		await resumed.run("session_start", context);
+		expect(resumed.getActiveTools()).toContain("plannotator_submit_plan");
+		expect(resumed.lastPersistedState()?.phase).toBe("planning");
+		expect((await startAgent(resumed, context))?.message?.details?.phase).toBe("planning");
+	});
+
+	test("an ordinary user fork still inherits its parent's plan state", async () => {
+		delete process.env.PI_SUBAGENT_CHILD;
+		const cwd = makeWorkspace();
+		const context = createContext({ cwd, entries: [{
+			type: "custom", customType: "plannotator", data: {
+				sessionId: "parent-session", phase: "planning",
+				savedState: { model: { provider: "claude-bridge", id: "parent-model" }, thinkingLevel: "high" },
+			},
+		}] });
+		const runtime = createRuntime();
+		await runtime.run("session_start", context);
+		expect(runtime.modelChanges).toEqual([{ provider: "claude-bridge", id: "parent-model" }]);
+		expect(runtime.thinkingChanges).toEqual(["high"]);
+		expect(runtime.getActiveTools()).toContain("plannotator_submit_plan");
+	});
+});
 
 describe("Plannotator phase framing messages", () => {
 	test("before_agent_start never returns a systemPrompt in any phase", async () => {

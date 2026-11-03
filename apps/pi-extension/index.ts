@@ -195,6 +195,8 @@ type SavedPhaseState = {
 };
 
 type PersistedPlannotatorState = {
+	/** Session that recorded this state; delegated children copy their parent's entries. */
+	sessionId?: string;
 	phase: Phase;
 	lastSubmittedPath?: string;
 	savedState?: SavedPhaseState;
@@ -478,6 +480,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 	let approvedPlanContent: string | null = null;
 	let checklistItems: ChecklistItem[] = [];
 	let savedState: SavedPhaseState | null = null;
+	let stateSessionId: string | undefined;
 	let phaseAddedTools: string[] = [];
 	let plannotatorConfig = {};
 	let justApprovedPlan = false;
@@ -693,6 +696,7 @@ export default function plannotator(pi: ExtensionAPI, deps: PlannotatorExtension
 
 	function persistState(): void {
 		pi.appendEntry("plannotator", {
+			sessionId: stateSessionId,
 			phase,
 			lastSubmittedPath,
 			savedState,
@@ -2491,6 +2495,7 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 		options: { phaseWhenUnrecorded: Phase; warnOnPlanning: boolean; keepModelWhenPhaseUnchanged?: boolean },
 	): Promise<void> {
 		const phaseBefore = phase;
+		stateSessionId = ctx.sessionManager.getSessionId();
 		const entries = ctx.sessionManager.getBranch();
 		const stateEntry = entries
 			.filter(
@@ -2499,7 +2504,24 @@ Call ${PLAN_MARK_DONE_TOOL} immediately after each completed step and before the
 			)
 			.pop() as { data?: PersistedPlannotatorState } | undefined;
 
-		if (stateEntry?.data) {
+		// parentSession also marks a user's ordinary /fork, which must keep its
+		// plan. pi-subagents marks delegated processes explicitly. Accept only
+		// this child's own state there (including after /reload or resume), not
+		// copied parent state or legacy entries without provenance.
+		const inheritedState = process.env.PI_SUBAGENT_CHILD === "1" && stateEntry?.data &&
+			stateEntry.data.sessionId !== stateSessionId ? stateEntry.data : undefined;
+		if (inheritedState) {
+			phase = "idle";
+			lastSubmittedPath = null;
+			savedState = null;
+			phaseAddedTools = [];
+			checklistItems = [];
+			approvedPlanContent = null;
+			framingDelivered = false;
+			// Keep the copied transcript cache-stable. The existing one-shot
+			// countermand neutralizes its framing without adopting the plan.
+			idleNoticePending = inheritedState.phase !== "idle" || inheritedState.idleNoticePending === true;
+		} else if (stateEntry?.data) {
 			phase = stateEntry.data.phase ?? options.phaseWhenUnrecorded;
 			lastSubmittedPath = stateEntry.data.lastSubmittedPath ?? lastSubmittedPath;
 			savedState = stateEntry.data.savedState ?? savedState;
