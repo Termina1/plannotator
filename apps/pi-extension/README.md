@@ -440,7 +440,11 @@ During **executing**:
 - Progress tracked via `[DONE:n]` markers in agent responses
 - Plan re-read from disk each turn to stay current
 
-State persists across session restarts via Pi's `appendEntry` API.
+State persists across session restarts via Pi's `appendEntry` API. A delegated
+pi-subagents child (`PI_SUBAGENT_CHILD=1`) starts idle instead of restoring its
+parent's copied plan, model, thinking level or phase tools. It can still enter
+plan mode explicitly and resume its own recorded state. Ordinary user `/fork`
+and `/tree` navigation keep their existing plan-state behavior.
 
 ## Requirements
 
